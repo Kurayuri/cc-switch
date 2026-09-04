@@ -2,20 +2,71 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  # Use the commit SHA so consecutive main-branch syncs do not cancel one another.
+  group: release-${{ github.ref_name }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
+  prepare_release:
+    name: Prepare release metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      manifest_version: ${{ steps.metadata.outputs.manifest_version }}
+      is_sync: ${{ steps.metadata.outputs.is_sync }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve release metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_version=$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")
+          if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Unsupported package version: $base_version" >&2
+            exit 1
+          fi
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            release_tag="$GITHUB_REF_NAME"
+            manifest_version="${release_tag#v}"
+            is_sync=false
+          else
+            short_sha="${GITHUB_SHA:0:7}"
+            release_tag="v${base_version}-sync.${GITHUB_RUN_NUMBER}.${short_sha}"
+            # The CI-only sync build keeps the app's embedded version unchanged.
+            manifest_version="$base_version"
+            is_sync=true
+          fi
+
+          {
+            echo "release_tag=$release_tag"
+            echo "manifest_version=$manifest_version"
+            echo "is_sync=$is_sync"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release tag: $release_tag"
+          echo "Manifest version: $manifest_version"
+          echo "Sync build: $is_sync"
+
   release:
+    needs: prepare_release
     runs-on: ${{ matrix.os }}
     environment: release
+    env:
+      IS_SYNC: ${{ needs.prepare_release.outputs.is_sync }}
+      RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -122,7 +173,16 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      - name: Disable updater artifacts for sync build
+        if: env.IS_SYNC == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e "const fs=require('fs'); const path='src-tauri/tauri.conf.json'; const config=JSON.parse(fs.readFileSync(path, 'utf8')); config.bundle ??= {}; config.bundle.createUpdaterArtifacts=false; fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\\n');"
+          echo "Updater artifacts disabled for sync build; official updater endpoints remain unchanged."
+
       - name: Prepare Tauri signing key
+        if: env.IS_SYNC != 'true'
         shell: bash
         run: |
           # 调试：检查 Secret 是否存在
@@ -179,7 +239,7 @@ jobs:
           echo "✅ Tauri signing key prepared"
 
       - name: Import Apple signing certificate
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.IS_SYNC != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -231,6 +291,12 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
+          if [ "$IS_SYNC" = "true" ]; then
+            echo "=== macOS unsigned sync build ==="
+            pnpm tauri build --target universal-apple-darwin
+            exit 0
+          fi
+
           max_attempts=3
           for attempt in $(seq 1 "$max_attempts"); do
             echo "=== macOS build/notarization attempt ${attempt}/${max_attempts} ==="
@@ -272,7 +338,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p release-assets
-          VERSION="${GITHUB_REF_NAME}"  # e.g., v3.5.0
+          VERSION="${RELEASE_TAG}"  # e.g., v3.20.1 or v3.20.1-sync.123.abcdef0
 
           # Locate bundle artifacts
           TAR_GZ=""; APP_PATH=""
@@ -287,24 +353,29 @@ jobs:
             fi
           done
 
-          if [ -z "$TAR_GZ" ]; then
-            echo "❌ No macOS .tar.gz updater artifact found" >&2
-            exit 1
-          fi
           if [ -z "$APP_PATH" ]; then
             echo "❌ No .app found" >&2
             exit 1
           fi
 
-          # Staple notarization ticket to .app (Tauri already notarized it)
-          xcrun stapler staple "$APP_PATH"
-          echo "✅ .app stapled"
+          if [ "$IS_SYNC" != "true" ]; then
+            if [ -z "$TAR_GZ" ]; then
+              echo "❌ No macOS .tar.gz updater artifact found" >&2
+              exit 1
+            fi
 
-          # 1) Collect .tar.gz (updater artifact)
-          NEW_TAR_GZ="CC-Switch-${VERSION}-macOS.tar.gz"
-          cp "$TAR_GZ" "release-assets/$NEW_TAR_GZ"
-          [ -f "$TAR_GZ.sig" ] && cp "$TAR_GZ.sig" "release-assets/$NEW_TAR_GZ.sig" || echo ".sig for macOS not found yet"
-          echo "macOS updater artifact copied: $NEW_TAR_GZ"
+            # Staple notarization ticket to .app (Tauri already notarized it)
+            xcrun stapler staple "$APP_PATH"
+            echo "✅ .app stapled"
+
+            # Collect .tar.gz updater artifact and its signature.
+            NEW_TAR_GZ="CC-Switch-${VERSION}-macOS.tar.gz"
+            cp "$TAR_GZ" "release-assets/$NEW_TAR_GZ"
+            [ -f "$TAR_GZ.sig" ] && cp "$TAR_GZ.sig" "release-assets/$NEW_TAR_GZ.sig" || echo ".sig for macOS not found yet"
+            echo "macOS updater artifact copied: $NEW_TAR_GZ"
+          else
+            echo "Sync build: skipping macOS updater artifact"
+          fi
 
           # 2) Collect .app as zip
           NEW_ZIP="CC-Switch-${VERSION}-macOS.zip"
@@ -312,11 +383,6 @@ jobs:
           echo "macOS zip ready: $NEW_ZIP"
 
           # 3) Create styled DMG with create-dmg (Tauri's built-in DMG styling doesn't work on CI)
-          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            echo "❌ APPLE_SIGNING_IDENTITY is missing before DMG creation" >&2
-            exit 1
-          fi
-
           HOMEBREW_NO_AUTO_UPDATE=1 brew install create-dmg
           NEW_DMG="CC-Switch-${VERSION}-macOS.dmg"
           DMG_STAGE_DIR="$RUNNER_TEMP/dmg-stage"
@@ -324,7 +390,7 @@ jobs:
           mkdir -p "$DMG_STAGE_DIR"
           ditto "$APP_PATH" "$DMG_STAGE_DIR/CC Switch.app"
 
-          create-dmg \
+          create_dmg_args=(
             --volname "CC Switch" \
             --background "src-tauri/icons/dmg-background.png" \
             --window-size 660 400 \
@@ -333,16 +399,24 @@ jobs:
             --icon "CC Switch.app" 180 220 \
             --hide-extension "CC Switch.app" \
             --app-drop-link 480 220 \
-            --codesign "$APPLE_SIGNING_IDENTITY" \
-            --no-internet-enable \
-            "release-assets/$NEW_DMG" \
-            "$DMG_STAGE_DIR"
+            --no-internet-enable
+          )
+          if [ "$IS_SYNC" != "true" ]; then
+            if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+              echo "❌ APPLE_SIGNING_IDENTITY is missing before DMG creation" >&2
+              exit 1
+            fi
+            create_dmg_args+=(--codesign "$APPLE_SIGNING_IDENTITY")
+          else
+            echo "Sync build: creating unsigned DMG"
+          fi
+          create-dmg "${create_dmg_args[@]}" "release-assets/$NEW_DMG" "$DMG_STAGE_DIR"
 
           rm -rf "$DMG_STAGE_DIR"
           echo "✅ Styled DMG created: $NEW_DMG"
 
       - name: Notarize macOS DMG
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.IS_SYNC != 'true'
         shell: bash
         timeout-minutes: 30
         env:
@@ -384,7 +458,7 @@ jobs:
           done
 
       - name: Verify macOS code signing and notarization
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.IS_SYNC != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -436,7 +510,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = $env:GITHUB_REF_NAME  # e.g., v3.5.0
+          $VERSION = $env:RELEASE_TAG  # e.g., v3.20.1 or v3.20.1-sync.123.abcdef0
           $isArm64 = $env:WINDOWS_RELEASE_ARCH -eq 'arm64'
           $targetRoot = if ($isArm64) { 'src-tauri/target/aarch64-pc-windows-msvc/release' } else { 'src-tauri/target/release' }
           $assetSuffix = if ($isArm64) { '-arm64' } else { '' }
@@ -455,7 +529,7 @@ jobs:
             if (Test-Path $sigPath) {
               Copy-Item $sigPath (Join-Path release-assets ("$dest.sig"))
               Write-Host "Signature copied: $dest.sig"
-            } elseif ($isArm64) {
+            } elseif ($isArm64 -and $env:IS_SYNC -ne 'true') {
               throw "Signature not found for $($msi.Name)"
             } else {
               Write-Warning "Signature not found for $($msi.Name)"
@@ -510,7 +584,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p release-assets
-          VERSION="${GITHUB_REF_NAME}"  # e.g., v3.5.0
+          VERSION="${RELEASE_TAG}"  # e.g., v3.20.1 or v3.20.1-sync.123.abcdef0
           ARCH="${{ matrix.arch || 'x86_64' }}"
           # Updater artifact: AppImage（含对应 .sig）
           APPIMAGE=$(find src-tauri/target/release/bundle -name "*.AppImage" | head -1 || true)
@@ -579,7 +653,9 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-22.04
-    needs: release
+    needs: [prepare_release, release]
+    env:
+      RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
     permissions:
       contents: write
     steps:
@@ -599,11 +675,12 @@ jobs:
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: CC Switch ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare_release.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: CC Switch ${{ needs.prepare_release.outputs.release_tag }}
           prerelease: true
           body: |
-            ## CC Switch ${{ github.ref_name }}
+            ## CC Switch ${{ needs.prepare_release.outputs.release_tag }}
 
             🌐 **Only Official Website / 唯一官方网站 / 唯一の公式サイト**: [ccswitch.io](https://ccswitch.io)
 
@@ -611,16 +688,16 @@ jobs:
 
             ### 下载
 
-            - **macOS**: `CC-Switch-${{ github.ref_name }}-macOS.dmg`（推荐）或 `CC-Switch-${{ github.ref_name }}-macOS.zip`（解压即用）
-            - **Windows (x86_64)**: `CC-Switch-${{ github.ref_name }}-Windows.msi`（安装版）或 `CC-Switch-${{ github.ref_name }}-Windows-Portable.zip`（绿色版）
-            - **Windows (ARM64)**: `CC-Switch-${{ github.ref_name }}-Windows-arm64.msi`（安装版）或 `CC-Switch-${{ github.ref_name }}-Windows-arm64-Portable.zip`（绿色版）
-            - **Linux (x86_64)**: `CC-Switch-${{ github.ref_name }}-Linux-x86_64.AppImage` / `.deb` / `.rpm`
-            - **Linux (ARM64)**: `CC-Switch-${{ github.ref_name }}-Linux-arm64.AppImage` / `.deb` / `.rpm`
+            - **macOS**: `CC-Switch-${{ needs.prepare_release.outputs.release_tag }}-macOS.dmg`（推荐）或 `CC-Switch-${{ needs.prepare_release.outputs.release_tag }}-macOS.zip`（解压即用）
+            - **Windows (x86_64)**: `CC-Switch-${{ needs.prepare_release.outputs.release_tag }}-Windows.msi`（安装版）或 `CC-Switch-${{ needs.prepare_release.outputs.release_tag }}-Windows-Portable.zip`（绿色版）
+            - **Windows (ARM64)**: `CC-Switch-${{ needs.prepare_release.outputs.release_tag }}-Windows-arm64.msi`（安装版）或 `CC-Switch-${{ needs.prepare_release.outputs.release_tag }}-Windows-arm64-Portable.zip`（绿色版）
+            - **Linux (x86_64)**: `CC-Switch-${{ needs.prepare_release.outputs.release_tag }}-Linux-x86_64.AppImage` / `.deb` / `.rpm`
+            - **Linux (ARM64)**: `CC-Switch-${{ needs.prepare_release.outputs.release_tag }}-Linux-arm64.AppImage` / `.deb` / `.rpm`
 
-            > `.tar.gz` 为 Tauri updater 自动更新专用，无需手动下载。
+            > Sync fork builds are unsigned/unnotarized test builds and do not participate in the updater channel. Official `v*` tag releases retain signing, notarization, and updater artifacts.
 
             ---
-            macOS 版本已通过 Apple 代码签名和公证，可直接安装使用。
+            macOS package signing and notarization depend on the build type described above.
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -628,7 +705,11 @@ jobs:
   assemble-latest-json:
     name: Assemble latest.json
     runs-on: ubuntu-22.04
-    needs: publish-release
+    needs: [prepare_release, publish-release]
+    if: needs.prepare_release.outputs.is_sync != 'true'
+    env:
+      RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.prepare_release.outputs.manifest_version }}
     permissions:
       contents: write
     steps:
@@ -642,17 +723,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${RELEASE_TAG}"
           mkdir -p dl
           gh release download "$TAG" --dir dl --repo "$GITHUB_REPOSITORY"
           ls -la dl || true
       - name: Generate latest.json
         env:
           REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare_release.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.prepare_release.outputs.manifest_version }}
         run: |
           set -euo pipefail
-          VERSION="${TAG#v}"
+          VERSION="$RELEASE_VERSION"
           PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           base_url="https://github.com/$REPO/releases/download/$TAG"
           # 初始化空平台映射
@@ -728,4 +810,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
-          gh release upload "$GITHUB_REF_NAME" latest.json --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$RELEASE_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
